@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import json
 import os
@@ -141,7 +142,7 @@ class FleetTests(unittest.TestCase):
         written = fc.write_reports(self.report(), out)
         names = sorted(os.path.relpath(p, out).replace(os.sep, "/") for p in written)
         self.assertEqual(names, ["clients/acme-dental.md", "clients/baker-law.md", "clients/dana-co.md",
-                                 "clients/eve-studio.md", "fleet.json", "fleet.md"])
+                                 "clients/eve-studio.md", "fleet.json", "fleet.md", "tickets.csv", "tickets.json"])
         text = all_text(out)
         for value in ["difyai123456", "dify-sandbox"] + list(dhc.PUBLISHED_VALUES) + STRONG_VALUES:
             self.assertNotIn(value, text)
@@ -165,6 +166,78 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(after["changes"]["new"], [])
         self.assertIsNone(self.report()["changes"])
 
+    # ------------------------------------------------------------ tickets (0.2.0)
+
+    def test_tickets_one_per_problem_with_stable_ids(self):
+        report = self.report()
+        tickets = fc.build_tickets(report)
+        ids = [t["id"] for t in tickets]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertTrue(all(t["status"] == "open" for t in tickets))
+        self.assertTrue(all(t["id"].startswith("aifc-") and len(t["id"]) == 17 for t in tickets))
+        # every actionable finding has a ticket, info notes do not, and an unreadable deployment does
+        checked = [r for r in report["results"] if not r["error"]]
+        keys = {(r["client"], r["app"], fc.issue_key(f)) for r in checked for f in r["findings"] if f["severity"] != "info"}
+        self.assertEqual(len([t for t in tickets if t["client"] != "Eve Studio"]), len(keys))
+        eve = [t for t in tickets if t["client"] == "Eve Studio"]
+        self.assertEqual(len(eve), 1)
+        self.assertIn("could not be checked", eve[0]["summary"])
+        self.assertEqual(eve[0]["priority"], "P2")
+        for t in tickets:
+            self.assertEqual(t["priority"], fc.PRIORITY[t["severity"]])
+            self.assertLessEqual(len(t["summary"]), 120)
+            self.assertTrue(t["summary"].startswith("[%s] " % t["client"]))
+        self.assertFalse([t for t in tickets if t["client"] == "Dana & Co" and t["setting"] == "credentials"])
+        acme_creds = [t for t in tickets if t["client"] == "Acme Dental" and t["setting"] == "credentials"]
+        self.assertEqual(len(acme_creds), 1)
+        self.assertEqual(acme_creds[0]["priority"], "P3")
+        self.assertIn("ROTATE.md", acme_creds[0]["description"])
+        # same files, same IDs on the next run; most urgent first
+        self.assertEqual(ids, [t["id"] for t in fc.build_tickets(self.report())])
+        self.assertEqual([t["priority"] for t in tickets], sorted(t["priority"] for t in tickets))
+
+    def test_ticket_ids_depend_on_deployment(self):
+        a = fc.ticket_id("Acme Dental", "dify", "", "credentials")
+        self.assertEqual(a, fc.ticket_id(" acme dental ", "dify", "", "credentials"))
+        self.assertNotEqual(a, fc.ticket_id("Acme Dental", "dify", "staging", "credentials"))
+        self.assertNotEqual(a, fc.ticket_id("Acme Dental", "openwebui", "", "credentials"))
+        self.assertNotEqual(a, fc.ticket_id("Baker Law", "dify", "", "credentials"))
+
+    def test_fixed_problems_become_resolved_tickets(self):
+        before_report = json.loads(json.dumps(self.report()))
+        before = {t["id"]: t for t in fc.build_tickets(before_report)}
+        write(self.d, "acme/dify/docker/.env", STRONG_ENV)
+        tickets = fc.build_tickets(self.report(before_report))
+        resolved = [t for t in tickets if t["status"] == "resolved"]
+        self.assertTrue(resolved)
+        for t in resolved:
+            self.assertIn(t["id"], before)
+            self.assertEqual(t["client"], "Acme Dental")
+            self.assertEqual(t["app"], "dify")
+        self.assertIn("credentials", [before[t["id"]]["setting"] for t in resolved])
+        open_ids = {t["id"] for t in tickets if t["status"] == "open"}
+        self.assertFalse(open_ids & {t["id"] for t in resolved})
+        self.assertEqual(tickets[-1]["status"], "resolved")   # open tickets first
+
+    def test_tickets_csv_is_importable_and_formula_safe(self):
+        fleet = dict(FLEET, deployments=FLEET["deployments"] + [
+            {"client": "=HYPERLINK(\"http://x\")", "app": "dify", "path": "baker/docker"}])
+        write(self.d, "fleet.json", json.dumps(fleet))
+        out = os.path.join(self.d, "out3")
+        os.makedirs(out)
+        paths = fc.write_tickets(fc.build_tickets(self.report()), out)
+        with open(paths[1], encoding="utf-8", newline="") as f:
+            rows = list(csv.reader(f))
+        self.assertEqual(rows[0], fc.TICKET_COLUMNS)
+        with open(paths[0], encoding="utf-8") as f:
+            self.assertEqual(len(rows) - 1, len(json.load(f)))
+        for row in rows[1:]:
+            for cell in row:
+                self.assertNotIn(cell[:1], ("=", "+", "-", "@"))
+        self.assertTrue([r for r in rows if r[2].startswith("'=HYPERLINK")])
+        self.assertEqual(fc._csv_safe("Acme"), "Acme")
+        self.assertEqual(fc._csv_safe("-1"), "'-1")
+
     def test_main_exit_codes_and_output(self):
         out = os.path.join(self.d, "out2")
         buf = io.StringIO()
@@ -172,6 +245,7 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(fc.main([self.fleet_path, "--out", out, "--checkers", HERE]), 0)
         self.assertIn("5 deployments", buf.getvalue())
         self.assertTrue(os.path.isfile(os.path.join(out, "fleet.json")))
+        self.assertTrue(os.path.isfile(os.path.join(out, "tickets.csv")))
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(fc.main([self.fleet_path, "--fail-on", "high", "--checkers", HERE]), 1)
         with contextlib.redirect_stderr(io.StringIO()):

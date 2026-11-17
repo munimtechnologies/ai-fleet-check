@@ -4,10 +4,12 @@ client's deployment files at once, for IT providers (MSPs) who run self-hosted
 AI apps for several small businesses.
 
 It writes one fleet summary (which clients need attention first, which problems
-repeat across clients, what changed since last time) and one plain-language
-report per client. Read-only, standard library only, works offline, and it never
-prints secret values: it only reads files you already have, it never contacts a
-client's server. Made with AI agents for MV2 of Munim, Inc. Apache-2.0.
+repeat across clients, what changed since last time), one plain-language report
+per client, and tickets for a PSA or helpdesk (CSV and JSON) with IDs that stay
+the same from one run to the next. Read-only, standard library only, works
+offline, and it never prints secret values: it only reads files you already
+have, it never contacts a client's server. Made with AI agents for MV2 of
+Munim, Inc. Apache-2.0.
 
     python3 fleet_check.py fleet.json --out reports/
     python3 fleet_check.py fleet.json --out reports/2026-12 --previous reports/2026-11/fleet.json
@@ -23,6 +25,8 @@ fleet.json lists one entry per deployment (paths are relative to fleet.json):
 """
 
 import argparse
+import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -30,10 +34,11 @@ import re
 import sys
 import textwrap
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 REPO = "https://github.com/munimtechnologies/ai-fleet-check"
 SEVERITIES = ["critical", "high", "medium", "low", "info"]
 RANK = {s: i for i, s in enumerate(SEVERITIES)}
+PRIORITY = {"critical": "P1", "high": "P2", "medium": "P3", "low": "P4"}
 
 # app name -> (module file, module name, upstream repo)
 CHECKERS = {
@@ -209,12 +214,13 @@ def changes(results, previous):
         now = {issue_key(f): f for f in r["findings"] if f["severity"] != "info"}
         if key not in before:
             continue
+        base = {"deployment": deployment_id(r), "client": r["client"], "app": r["app"], "label": r["label"]}
         for k, f in now.items():
             if k not in before[key]:
-                new.append({"deployment": deployment_id(r), "severity": f["severity"], "title": f["title"]})
+                new.append(dict(base, severity=f["severity"], title=f["title"], key=k))
         for k, f in before[key].items():
             if k not in now:
-                fixed.append({"deployment": deployment_id(r), "severity": f["severity"], "title": f["title"]})
+                fixed.append(dict(base, severity=f["severity"], title=f["title"], key=k))
     order = lambda x: (RANK[x["severity"]], x["deployment"], x["title"])
     return {"new": sorted(new, key=order), "fixed": sorted(fixed, key=order)}
 
@@ -232,6 +238,92 @@ def run_fleet(fleet, checkers_dir, previous=None):
             "checkers": versions, "deployments": len(results),
             "errors": sum(1 for r in results if r["error"]), "counts": total,
             "results": results, "common": common_issues(results), "changes": changes(results, previous)}
+
+
+# ---------------------------------------------------------------- tickets
+
+def ticket_id(client, app, label, key):
+    """Stable across runs: the same problem on the same deployment always gets the same ID, so a PSA
+    import can update or close the existing ticket instead of opening a duplicate."""
+    raw = "\x1f".join([client.strip().lower(), app, (label or "").strip().lower(), key])
+    return "aifc-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _summary(client, app, label, title):
+    text = "[%s] %s%s: %s" % (client, APP_NAMES[app], (" (%s)" % label) if label else "", title)
+    return text if len(text) <= 120 else text[:117].rstrip() + "..."
+
+
+def build_tickets(report):
+    """One open ticket per actionable finding (info notes are left out) and per deployment that could not
+    be checked; with --previous, one resolved ticket per finding that has gone away. Ticket text comes
+    from the same fields as the client reports, so it carries setting names but never values."""
+    tickets = []
+    tool = "ai-fleet-check %s" % report["version"]
+    for r in report["results"]:
+        base = {"client": r["client"], "app": r["app"], "label": r["label"], "deployment": deployment_id(r)}
+        if r["error"]:
+            tickets.append(dict(base, id=ticket_id(r["client"], r["app"], r["label"], "could-not-check"),
+                                status="open", severity="high", priority=PRIORITY["high"], setting="",
+                                summary=_summary(r["client"], r["app"], r["label"], "could not be checked"),
+                                description="%s could not check this deployment: %s\n\nUpdate the path in fleet.json "
+                                            "or copy the deployment's current files, then run the check again."
+                                            % (tool, r["error"]),
+                                source=REPO))
+            continue
+        seen = {}
+        for f in r["findings"]:   # sorted most severe first
+            if f["severity"] == "info":
+                continue
+            tid = ticket_id(r["client"], r["app"], r["label"], issue_key(f))
+            if tid in seen:   # two findings about one setting: one ticket, at the higher severity
+                seen[tid]["description"] += "\n\nAlso: %s (%s). What to do: %s" % (f["title"], f["severity"], f["fix"])
+                continue
+            parts = []
+            if f.get("detail"):
+                parts.append(f["detail"])
+            parts.append("What to do: " + f["fix"])
+            parts.append("Source: " + f["source"])
+            parts.append("Found by %s (%s, %s). Setting names only; no secret values." % (
+                tool, APP_NAMES[r["app"]], (r["version"] or "version unknown").split(" ")[0]))
+            seen[tid] = dict(base, id=tid, status="open", severity=f["severity"], priority=PRIORITY[f["severity"]],
+                             setting=f.get("setting") or "",
+                             summary=_summary(r["client"], r["app"], r["label"], f["title"]),
+                             description="\n\n".join(parts), source=f["source"])
+            tickets.append(seen[tid])
+    ch = report.get("changes")
+    if ch:
+        for x in ch["fixed"]:
+            tickets.append({"client": x["client"], "app": x["app"], "label": x["label"], "deployment": x["deployment"],
+                            "id": ticket_id(x["client"], x["app"], x["label"], x["key"]),
+                            "status": "resolved", "severity": x["severity"], "priority": PRIORITY[x["severity"]],
+                            "setting": "", "summary": _summary(x["client"], x["app"], x["label"], x["title"]),
+                            "description": "No longer found by %s: fixed since the previous check." % tool,
+                            "source": REPO})
+    order = {"open": 0, "resolved": 1}
+    return sorted(tickets, key=lambda t: (order[t["status"]], t["priority"], t["client"].lower(), t["summary"]))
+
+
+TICKET_COLUMNS = ["id", "status", "client", "priority", "severity", "summary", "description", "deployment",
+                  "app", "setting", "source"]
+
+
+def _csv_safe(value):
+    """Spreadsheet apps run cells that start with = + - @ as formulas; a client name or title must not."""
+    value = str(value)
+    return "'" + value if value[:1] in ("=", "+", "-", "@", "\t", "\r") else value
+
+
+def write_tickets(tickets, out_dir):
+    paths = [os.path.join(out_dir, "tickets.json"), os.path.join(out_dir, "tickets.csv")]
+    with open(paths[0], "w", encoding="utf-8") as f:
+        json.dump(tickets, f, indent=2)
+    with open(paths[1], "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(TICKET_COLUMNS)
+        for t in tickets:
+            w.writerow([_csv_safe(t[c]) for c in TICKET_COLUMNS])
+    return paths
 
 
 # ---------------------------------------------------------------- reports
@@ -352,6 +444,7 @@ def write_reports(report, out_dir):
     with open(path, "w", encoding="utf-8") as f:
         f.write(render_fleet_markdown(report) + "\n")
     written.append(path)
+    written += write_tickets(build_tickets(report), out_dir)
     by_client, used = {}, {}
     for r in report["results"]:
         by_client.setdefault(r["client"], []).append(r)
@@ -373,9 +466,10 @@ def main(argv=None):
     p = argparse.ArgumentParser(
         prog="fleet_check.py",
         description="Check every client's self-hosted Dify and Open WebUI deployment files at once and write a "
-                    "fleet summary plus one report per client. Read-only; offline; secret values are never printed.")
+                    "fleet summary, one report per client and PSA tickets. Read-only; offline; secret values are "
+                    "never printed.")
     p.add_argument("fleet", help="fleet.json listing client, app (dify or openwebui) and path or files")
-    p.add_argument("--out", help="folder for fleet.json, fleet.md and clients/*.md")
+    p.add_argument("--out", help="folder for fleet.json, fleet.md, tickets.csv, tickets.json and clients/*.md")
     p.add_argument("--previous", help="an earlier fleet.json, to list what was fixed and what is new")
     p.add_argument("--checkers", default=here,
                    help="folder holding dify_hardening_check.py and owui_hardening_check.py (default: next to this file)")

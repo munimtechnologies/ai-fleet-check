@@ -3,12 +3,13 @@
 For IT providers (MSPs) who run self-hosted AI apps such as [Dify](https://github.com/langgenius/dify) and [Open WebUI](https://github.com/open-webui/open-webui) for several small businesses: check every client's deployment files in one command, and get
 
 - **one fleet summary**: which deployments need attention first, which problems repeat across clients (fix them once in your standard build), and what was fixed or is new since last month;
-- **one plain-language report per client** that you can send as it is. It says what was checked and what to change, in order, and never contains a password or key.
+- **one plain-language report per client** that you can send as it is. It says what was checked and what to change, in order, and never contains a password or key;
+- **tickets for your PSA or helpdesk** (`tickets.csv` and `tickets.json`). Each problem keeps the same ticket ID from month to month, so a re-import updates the existing ticket instead of opening a duplicate, and problems that went away come back as `resolved`.
 
 It runs [dify-hardening-check](https://github.com/munimtechnologies/dify-hardening-check) and [openwebui-hardening-check](https://github.com/munimtechnologies/openwebui-hardening-check) on each deployment: published default passwords and keys still in use (including Dify 1.19's `docker/envs/**/*.defaults`), databases and sandboxes published to the network, risky settings and each project's known security advisories.
 
 - **Offline and read-only.** It reads the files you already keep for each client (compose files, `.env`, `docker inspect` output, Kubernetes manifests). It never contacts a client's server.
-- **Secret values are never printed**, in the summary, the client reports or the JSON. Only setting names such as `DB_PASSWORD` appear.
+- **Secret values are never printed**, in the summary, the client reports, the tickets or the JSON. Only setting names such as `DB_PASSWORD` appear.
 - Standard library Python 3, no install. Apache-2.0.
 
 Made with AI agents for MV2 of Munim, Inc. Check data: the two checkers' own data dates (17 November 2026 for 0.1.3), shown at the top of every summary.
@@ -19,6 +20,8 @@ Made with AI agents for MV2 of Munim, Inc. Check data: the two checkers' own dat
 git clone https://github.com/munimtechnologies/ai-fleet-check && cd ai-fleet-check
 python3 fleet_check.py /path/to/fleet.json --out reports/2026-11
 ```
+
+Try it first on a made-up fleet of three clients: `python3 examples/make_example.py /tmp/demo`, then open `/tmp/demo/reports/fleet.md`.
 
 `fleet.json` lists one entry per deployment. Paths are relative to `fleet.json`:
 
@@ -45,7 +48,8 @@ It writes:
 |---|---|
 | `fleet.md` | The summary: a table of deployments, most urgent first; problems found on more than one deployment; changes since the previous check |
 | `clients/<client>.md` | One report per client, all their deployments, findings in order with what to do and a source link for each |
-| `fleet.json` | Everything above as JSON, for your PSA or ticketing tool; pass it back with `--previous` next month |
+| `tickets.csv`, `tickets.json` | One ticket per problem per deployment, most urgent first (see below) |
+| `fleet.json` | Everything above as JSON for your own tools; pass it back with `--previous` next month |
 
 Monthly, with what changed:
 
@@ -57,11 +61,21 @@ Options:
 
 | Option | What it does |
 |---|---|
-| `--out DIR` | Writes `fleet.md`, `fleet.json` and `clients/*.md`. Without it, only the text summary is printed. |
-| `--previous FILE` | An earlier `fleet.json`: lists findings fixed and findings new since then, per deployment. |
+| `--out DIR` | Writes `fleet.md`, `fleet.json`, `tickets.csv`, `tickets.json` and `clients/*.md`. Without it, only the text summary is printed. |
+| `--previous FILE` | An earlier `fleet.json`: lists findings fixed and findings new since then, per deployment, and adds `resolved` tickets. |
 | `--json` | Prints the fleet JSON instead of the text summary. |
 | `--fail-on high` | Exit code 1 when any deployment has a finding this severe or worse, or couldn't be checked (for CI or a scheduled job). Default: `never`. |
 | `--checkers DIR` | Where `dify_hardening_check.py` and `owui_hardening_check.py` are. Default: next to `fleet_check.py`. Use it to run newer checker releases. |
+
+## Tickets for your PSA or helpdesk
+
+`tickets.csv` has one row per ticket with the columns `id, status, client, priority, severity, summary, description, deployment, app, setting, source`. Map them in your PSA's CSV import (company = `client`, external ID = `id`), or read `tickets.json` from a script that calls your PSA's API.
+
+- **One ticket per problem per deployment.** Informational notes don't get tickets. Two findings about the same setting on one deployment share a ticket at the higher severity. A deployment that couldn't be checked gets one ticket of its own.
+- **Priority:** critical → `P1`, high → `P2`, medium → `P3`, low → `P4`.
+- **Stable IDs:** `id` (for example `aifc-3f9c0a1b2d4e`) is a hash of the client, app, label and the setting or check, so it is the same every month while the problem lasts. Upper/lower case and spaces around the client name don't change it; renaming a client or a label does.
+- **Resolved tickets:** with `--previous`, every problem found last time and gone now is listed with `status` = `resolved` and the same `id`, so your PSA can close it.
+- **Safe to import:** descriptions carry setting names, what to do and a source link, never values. Cells that a spreadsheet would treat as a formula (starting with `=`, `+`, `-` or `@`) are prefixed with `'`.
 
 ## How it ranks
 
@@ -71,6 +85,7 @@ A deployment that couldn't be checked (missing folder, unreadable file) comes fi
 
 - It checks only the files you give it. A value set somewhere it can't see (a secrets manager, `${VAR}` from the shell, Kubernetes `valueFrom`) is treated as unknown, not as a problem.
 - The checkers' advisory data is as of their data date. Update the two checker files (or point `--checkers` at newer ones) when Dify or Open WebUI publish new advisories.
+- A ticket marked `resolved` means the problem is no longer in the files checked, not that anyone confirmed the server was changed.
 - Not a scanner or a certification. This is general technical information.
 
 ## Written review
